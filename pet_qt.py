@@ -12,6 +12,8 @@ import os
 import random
 import sys
 
+from pet_settings import load_settings, save_settings
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 IMG = os.path.join(HERE, "xixi.png")
 IMG_SAD = os.path.join(HERE, "xixi_sad.png")
@@ -20,7 +22,7 @@ from PyQt5.QtCore import (Qt, QTimer, QPoint, QPointF, QRectF, QElapsedTimer,
                           QSize, QPropertyAnimation, QEvent)
 from PyQt5.QtGui import (QPainter, QPixmap, QColor, QFont, QFontMetrics, QPen,
                          QBrush, QLinearGradient, QRadialGradient)
-from PyQt5.QtWidgets import (QApplication, QWidget, QPushButton, QLineEdit,
+from PyQt5.QtWidgets import (QApplication, QWidget, QPushButton, QLineEdit, QMenu,
                              QLabel, QHBoxLayout, QVBoxLayout,
                              QGraphicsDropShadowEffect, QGraphicsOpacityEffect)
 
@@ -454,6 +456,14 @@ class RecallButton(QPushButton):
         super().__init__("✨ 唤回汐汐")
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.menu = QMenu(self)
+        self.menu.addAction("唤回汐汐").triggered.connect(self.click)
+        self.menu.addSeparator()
+        self.menu.addAction("退出桌宠").triggered.connect(self.close)
+
+    def contextMenuEvent(self, e):
+        self.menu.exec_(e.globalPos())
+        e.accept()
 
     def closeEvent(self, e):
         super().closeEvent(e)
@@ -470,6 +480,9 @@ class PetWindow(QWidget):
 
     def __init__(self):
         super().__init__()
+        self._settings_ready = False
+        settings = load_settings()
+        self._last_saved_settings = settings
         ensure_sad_pixmap()
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
@@ -479,13 +492,13 @@ class PetWindow(QWidget):
         # 图片
         self.pix_normal = QPixmap(IMG)
         self.pix_sad = QPixmap(IMG_SAD) if os.path.exists(IMG_SAD) else self.pix_normal
-        self.pet_scale = 1.0
+        self.pet_scale = settings["scale"]
         self._pix_cache = (1.0, None, None)
 
         # 状态
         self.fullness = 78.0
         self.mood = 82.0
-        self.sound_on = True
+        self.sound_on = settings["sound_on"]
         self.asleep = False
         self.pet_state = "idle"          # idle/patting/happy/eating/thinking/asleep
         self.state_start = 0
@@ -510,13 +523,21 @@ class PetWindow(QWidget):
         self._state_timer = QTimer(self)
         self._state_timer.setSingleShot(True)
         self._state_timer.timeout.connect(self._state_timeout)
+        self._settings_timer = QTimer(self)
+        self._settings_timer.setSingleShot(True)
+        self._settings_timer.setInterval(500)
+        self._settings_timer.timeout.connect(self._save_settings)
+        self._screen_timer = QTimer(self)
+        self._screen_timer.setSingleShot(True)
+        self._screen_timer.timeout.connect(self._keep_on_screen)
 
         init_sounds()   # 预热音效（需主线程）
-        self.voice_lang = "cn"
+        self.voice_lang = settings["voice_lang"]
         load_voices()   # 预载汐的真人语音
 
         self._build_ui()
-        self.relayout()
+        self._resize_for_scale(self.pet_scale)
+        self._restore_position(settings["position"])
 
         # 渲染循环（60fps，驱动全部动画与粒子）
         self.render_timer = QTimer(self)
@@ -542,6 +563,88 @@ class PetWindow(QWidget):
         self._fade = QPropertyAnimation(self, b"windowOpacity", self)
         self._fade.setDuration(500)
         self._fade.finished.connect(self._after_fade_out)
+        self._settings_ready = True
+        app = QApplication.instance()
+        app.screenAdded.connect(self._watch_screen)
+        app.screenRemoved.connect(self._schedule_screen_check)
+        for screen in app.screens():
+            self._watch_screen(screen)
+
+    # ---------------- 本机设置与窗口位置 ----------------
+    def _queue_settings_save(self):
+        if self._settings_ready:
+            self._settings_timer.start()
+
+    def _save_settings(self):
+        if not self._settings_ready:
+            return
+        self._settings_timer.stop()
+        settings = {
+            "position": {"x": self.x(), "y": self.y()},
+            "scale": self.pet_scale,
+            "voice_lang": self.voice_lang,
+            "sound_on": self.sound_on,
+        }
+        if settings != self._last_saved_settings and save_settings(settings):
+            self._last_saved_settings = settings
+
+    def _restore_position(self, position):
+        if position is not None:
+            self.move(position["x"], position["y"])
+        else:
+            screen = QApplication.primaryScreen()
+            if screen is not None:
+                area = screen.availableGeometry()
+                self.move(area.right() - self.width() - 40,
+                          area.bottom() - self.height() - 60)
+        self._keep_on_screen()
+
+    def _watch_screen(self, screen):
+        screen.availableGeometryChanged.connect(self._schedule_screen_check)
+        self._schedule_screen_check()
+
+    def _schedule_screen_check(self, *_args):
+        # 等屏幕列表更新后再调整窗口，多次通知合并为一次处理。
+        self._screen_timer.start()
+
+    def _window_screen(self):
+        """优先选择与窗口重叠最多的屏幕，找不到时使用主屏幕。"""
+        best_screen = QApplication.primaryScreen()
+        best_overlap = 0
+        window_rect = self.frameGeometry()
+        for screen in QApplication.screens():
+            overlap = window_rect.intersected(screen.availableGeometry())
+            area = max(0, overlap.width()) * max(0, overlap.height())
+            if area > best_overlap:
+                best_screen, best_overlap = screen, area
+        return best_screen
+
+    def _keep_on_screen(self):
+        screen = self._window_screen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        if area.isEmpty():
+            return
+        if self.width() > area.width() or self.height() > area.height():
+            ratio = min(area.width() / self.width(), area.height() / self.height())
+            scale = max(0.5, math.floor(self.pet_scale * ratio * 100) / 100)
+            if scale < self.pet_scale:
+                self._resize_for_scale(scale)
+                # 小字号和按钮内边距有最小值，极窄屏幕下再使用最小比例。
+                if self.width() > area.width() or self.height() > area.height():
+                    self._resize_for_scale(0.5)
+        x = max(area.left(), min(self.x(), area.right() - self.width() + 1))
+        y = max(area.top(), min(self.y(), area.bottom() - self.height() + 1))
+        self.move(x, y)
+        if self._resting and self.btn_recall.isVisible():
+            self._position_recall_button()
+        self._queue_settings_save()
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        if getattr(self, "_settings_ready", False):
+            self._queue_settings_save()
 
     # ---------------- 音效 ----------------
     def _beep(self, kind="pop"):
@@ -670,11 +773,11 @@ class PetWindow(QWidget):
         self.btn_chat.setCursor(Qt.PointingHandCursor)
         self.btn_chat.clicked.connect(self._on_chat_click)
 
-        self.btn_sound = QPushButton("🔊", self)
+        self.btn_sound = QPushButton("🔊" if self.sound_on else "🔇", self)
         self.btn_sound.setCursor(Qt.PointingHandCursor)
         self.btn_sound.clicked.connect(self._on_sound_click)
 
-        self.btn_lang = QPushButton("中", self)
+        self.btn_lang = QPushButton("日" if self.voice_lang == "jp" else "中", self)
         self.btn_lang.setCursor(Qt.PointingHandCursor)
         self.btn_lang.clicked.connect(self._on_lang_click)
 
@@ -1217,7 +1320,6 @@ class PetWindow(QWidget):
         self.say_voice(key)
 
     def _build_voice_menu(self):
-        from PyQt5.QtWidgets import QMenu
         self.voice_menu = QMenu(self)
         self.voice_menu.setStyleSheet("""
             QMenu{background:#ffffff;border:1px solid #2ec4d9;border-radius:10px;padding:6px;}
@@ -1242,6 +1344,9 @@ class PetWindow(QWidget):
         for key, label in items:
             act = self.voice_menu.addAction(label)
             act.triggered.connect(lambda checked=False, k=key: self._on_voice_selected(k))
+        self.voice_menu.addSeparator()
+        self.voice_menu.addAction("休息").triggered.connect(self._on_close_click)
+        self.voice_menu.addAction("退出桌宠").triggered.connect(self.close)
 
     def _on_lang_click(self):
         self.voice_lang = "jp" if self.voice_lang == "cn" else "cn"
@@ -1249,6 +1354,7 @@ class PetWindow(QWidget):
         self._mark_interact()
         self.wake_if_asleep(speak=False)
         self.say_voice("hello")   # 用新语言打声招呼，字幕仍是中文
+        self._queue_settings_save()
 
     def _on_sound_click(self):
         self._mark_interact()
@@ -1260,10 +1366,12 @@ class PetWindow(QWidget):
         else:
             stop_audio()
         self.bubble.say("（打开声音）" if self.sound_on else "（静音模式）", 1800)
+        self._queue_settings_save()
 
     def _on_close_click(self):
         if self._resting:
             return
+        self._save_settings()
         self._resting = True
         self._mark_interact()
         self.idle_timer.stop()
@@ -1309,7 +1417,7 @@ class PetWindow(QWidget):
         center = self.frameGeometry().center()
         x = center.x() - self.btn_recall.width() // 2
         y = center.y() - self.btn_recall.height() // 2
-        screen = QApplication.screenAt(center) or QApplication.primaryScreen()
+        screen = self._window_screen()
         if screen is not None:
             area = screen.availableGeometry()
             x = max(area.left(), min(x, area.right() - self.btn_recall.width() + 1))
@@ -1365,20 +1473,17 @@ class PetWindow(QWidget):
         s = round(max(0.5, min(2.0, s)) * 100) / 100.0
         if abs(s - self.pet_scale) < 0.001:
             return
+        self._resize_for_scale(s)
+        self._keep_on_screen()
+        self.scale_toast.show()
+        self._toast_timer.start(900)
+
+    def _resize_for_scale(self, s):
         self.pet_scale = s
         self._pix_cache = (-1, None, None)      # 缓存失效
         self.resize(int(BASE_W * s), int(BASE_H * s))   # 原生 resize，丝滑
         self.relayout()
-        # 放大后收回超出屏幕的部分，保留关闭按钮和底部栏的操作位置。
-        screen = self.screen() or QApplication.primaryScreen()
-        if screen is not None:
-            area = screen.availableGeometry()
-            x = max(area.left(), min(self.x(), area.right() - self.width() + 1))
-            y = max(area.top(), min(self.y(), area.bottom() - self.height() + 1))
-            self.move(x, y)
-        self.scale_toast.setText("%d%%" % int(s * 100))
-        self.scale_toast.show()
-        self._toast_timer.start(900)
+        self.scale_toast.setText("%d%%" % int(round(s * 100)))
 
     # ---------------- 鼠标（原生拖动） ----------------
     def mousePressEvent(self, e):
@@ -1431,8 +1536,7 @@ def main():
     app.setQuitOnLastWindowClosed(True)
     app.aboutToQuit.connect(stop_audio)
     pet = PetWindow()
-    geo = app.primaryScreen().availableGeometry()
-    pet.move(geo.right() - pet.width() - 40, geo.bottom() - pet.height() - 60)
+    app.aboutToQuit.connect(pet._save_settings)
     pet.show()
     sys.exit(app.exec_())
 

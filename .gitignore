@@ -22,3 +22,7 @@ venv/
 
 # 本地迭代计划
 /ITERATION_PLAN.local.md
+
+# 本机桌宠设置与写入临时文件
+/pet_settings.json
+/.pet_settings-*.tmp
