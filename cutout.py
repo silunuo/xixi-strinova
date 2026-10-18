@@ -7,13 +7,23 @@
 3. 清理残留小噪点（星星点）、填充内部孔洞（防止误食深色衣领）
 4. 边缘抗锯齿 + 裁剪到内容边界
 """
+import os
+
 import numpy as np
 from PIL import Image, ImageFilter
 from scipy import ndimage
 
-SRC = "f:/迅雷下载/工作区/xixi-pet/source.jpeg"
-MASK = "f:/迅雷下载/工作区/xixi-pet/xixi_raw.png"   # u2net 输出（含面板）
-OUT = "f:/迅雷下载/工作区/xixi-pet/xixi.png"
+HERE = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.join(HERE, "source.jpeg")
+MASK = os.path.join(HERE, "xixi_raw.png")   # u2net 输出（含面板）
+OUT = os.path.join(HERE, "xixi.png")
+
+for path in (SRC, MASK):
+    if not os.path.isfile(path):
+        raise FileNotFoundError(
+            f"缺少抠图输入文件：{path}。请将原图 source.jpeg 和 u2net 输出的 "
+            "xixi_raw.png 放在项目目录后再运行。"
+        )
 
 src = np.array(Image.open(SRC).convert("RGB")).astype(np.int16)
 u2 = np.array(Image.open(MASK).convert("RGBA"))

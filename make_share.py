@@ -15,37 +15,6 @@ SHARE_ROOT = os.path.join(HERE, "分享版")
 SHARE = os.path.join(SHARE_ROOT, "汐汐小桌宠")
 ZIP_BASE = os.path.join(HERE, "汐汐小桌宠-分享版")
 
-# 通用启动器（GBK 编码，中文 Windows 的 cmd 下正常显示）
-BAT = r'''@echo off
-cd /d %~dp0
-title 汐汐小桌宠
-where python >nul 2>nul
-if errorlevel 1 (
-    echo.
-    echo   [需要先安装 Python]
-    echo   请打开 https://www.python.org/downloads/ 下载安装 Python 3.8 以上版本，
-    echo   安装时务必勾选 "Add Python to PATH"，装好后重新双击本文件。
-    echo.
-    pause
-    exit /b 1
-)
-python -c "import PyQt5, numpy, pygame" >nul 2>nul
-if errorlevel 1 (
-    echo.
-    echo   首次运行，正在自动安装依赖（需要联网，约 1-2 分钟）...
-    echo.
-    python -m pip install PyQt5 numpy pygame
-    if errorlevel 1 (
-        echo.
-        echo   依赖安装失败，请检查网络后重试。
-        pause
-        exit /b 1
-    )
-)
-python pet_qt.py
-if errorlevel 1 pause
-'''
-
 README = '''汐汐小桌宠 · 使用说明
 ==============================
 
@@ -54,19 +23,23 @@ README = '''汐汐小桌宠 · 使用说明
    下载：https://www.python.org/downloads/
    安装时务必勾选 "Add Python to PATH"
 2. 双击「启动桌宠.bat」
-   首次运行会自动安装依赖（需联网，约 1-2 分钟）
-3. 之后汐汐会出现在屏幕右下角
+   启动器优先使用项目内 .venv、venv 中的 Python，然后查找 py 和 python。
+   缺少依赖时会显示 PowerShell 安装命令，请按提示执行后重新启动。
+3. 依赖安装完成后，汐汐会出现在屏幕右下角
 
 【玩法】
 - 按住脑袋 rua 头 / 按住身体拖动 / 滚轮放大缩小
 - 底部按钮：摸摸头、投喂、聊聊、🔊 音效、中/日 语音切换
 - 右键汐汐：弹出语音菜单，点哪条她念哪条
+- 语音最多同时播放两段，新语音开始时，上一段会在 300 毫秒内淡出
+- 连续触发第三段语音时，会停止最早的一段；静音会停止当前声音
 - 聊天里带"对吗"，她会回答"对的对的 / 不对不对"
 - 点右侧小叉让她休息，再点"唤回汐汐"叫她回来
 
 【发给别人 / 换电脑】
 把整个「汐汐小桌宠」文件夹打包发过去，
-对方装好 Python 后双击「启动桌宠.bat」即可，无需其他配置。
+对方装好 Python 后双击「启动桌宠.bat」。
+缺少依赖时，按启动器提示执行 requirements.txt 的安装命令。
 
 【文件说明】
 pet_qt.py        主程序
@@ -74,6 +47,7 @@ xixi.png         人物图（透明背景）
 xixi_sad.png     难过状态的去饱和图
 voice/           汐汐语音（中/日 各 13 段）
 启动桌宠.bat     双击启动
+requirements.txt 运行依赖清单
 使用说明.txt     本文件
 
 【版权】
@@ -88,7 +62,8 @@ def main():
     os.makedirs(SHARE)
 
     # 必需文件
-    for name in ("pet_qt.py", "xixi.png", "xixi_sad.png"):
+    for name in ("pet_qt.py", "xixi.png", "xixi_sad.png",
+                 "启动桌宠.bat", "requirements.txt"):
         shutil.copy(os.path.join(HERE, name), os.path.join(SHARE, name))
 
     # 语音
@@ -102,9 +77,7 @@ def main():
     shutil.copy(os.path.join(HERE, "voice", "manifest.json"),
                 os.path.join(SHARE, "voice", "manifest.json"))
 
-    # 启动器与说明
-    with open(os.path.join(SHARE, "启动桌宠.bat"), "w", encoding="gbk", errors="replace") as f:
-        f.write(BAT)
+    # 启动器与依赖清单直接复用项目文件，只在这里生成分享版说明。
     with open(os.path.join(SHARE, "使用说明.txt"), "w", encoding="utf-8-sig") as f:
         f.write(README)
 

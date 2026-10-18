@@ -96,13 +96,16 @@ def ensure_sad_pixmap():
 # 与网页版 index.html 的 WebAudio 完全一致的配方：
 #   振荡器(sine/square/triangle) + gain 从 vol 指数衰减到 0.0001（时长即 dur），
 #   无 attack（正弦/方波零相位起幅，听感就是网页版那种短促敲击）。
-# 播放用 pygame.mixer：16 声道自动分配，多音效同时响、互不打断、完整播完、不丢音。
+# pygame.mixer 使用 16 个音效声道，另留 2 个专用声道播放语音。
 import io
 import wave
 
 import numpy as np
 
 SAMPLE_RATE = 44100
+SOUND_CHANNEL_COUNT = 16
+VOICE_MAX_CONCURRENT = 2
+VOICE_FADEOUT_MS = 300
 
 
 def _render_tone(freq, dur, vol=0.5, wave_type="sine"):
@@ -160,11 +163,12 @@ def _build_sounds():
 
 _SOUNDS = None
 _MIXER_OK = False
+_voice_channels = []
 
 
 def init_sounds():
     """初始化 pygame 混音器并加载全部音效（主线程调用一次）"""
-    global _SOUNDS, _MIXER_OK
+    global _SOUNDS, _MIXER_OK, _voice_channels
     if _SOUNDS is not None:
         return _SOUNDS
     _SOUNDS = {}
@@ -173,7 +177,9 @@ def init_sounds():
         import pygame
         if not pygame.mixer.get_init():
             pygame.mixer.init(frequency=SAMPLE_RATE, size=-16, channels=1, buffer=512)
-        pygame.mixer.set_num_channels(16)     # 足够快速连点也不丢音
+        pygame.mixer.set_num_channels(SOUND_CHANNEL_COUNT + VOICE_MAX_CONCURRENT)
+        pygame.mixer.set_reserved(VOICE_MAX_CONCURRENT)
+        _voice_channels = [pygame.mixer.Channel(i) for i in range(VOICE_MAX_CONCURRENT)]
         for key, data in _build_sounds().items():
             snd = pygame.mixer.Sound(file=io.BytesIO(data))
             snd.set_volume(0.5)
@@ -183,6 +189,7 @@ def init_sounds():
         print("音效初始化失败（将静音运行）:", e, flush=True)
         _SOUNDS = {}
         _MIXER_OK = False
+        _voice_channels = []
     return _SOUNDS
 
 
@@ -198,6 +205,36 @@ def play_sound(name):
     except Exception:
         pass
 
+
+def play_voice(sound):
+    """最多同时播放两段语音，新语音开始时淡出上一段。"""
+    if not _MIXER_OK or not _voice_channels:
+        return
+    try:
+        # 优先使用空闲声道；两个声道都在播放时，停止最早的一段。
+        channel = next((ch for ch in _voice_channels if not ch.get_busy()),
+                       _voice_channels[0])
+        channel.stop()
+        for previous in _voice_channels:
+            if previous is not channel and previous.get_busy():
+                previous.fadeout(VOICE_FADEOUT_MS)
+        channel.play(sound)
+        # 按开始播放的先后顺序保存，方便下次找到最早的语音。
+        _voice_channels.remove(channel)
+        _voice_channels.append(channel)
+    except Exception as e:
+        print("语音播放失败:", e, flush=True)
+
+
+def stop_audio():
+    """停止正在播放的语音和音效。"""
+    if not _MIXER_OK:
+        return
+    try:
+        import pygame
+        pygame.mixer.stop()
+    except Exception as e:
+        print("停止声音失败:", e, flush=True)
 
 
 # ---------------------------------------------------------------- 语音
@@ -246,7 +283,7 @@ def load_voices():
                 snd.set_volume(0.9)
                 _voices[lang][key] = snd
                 with _wave.open(path) as w:
-                    _voice_dur[key] = w.getnframes() / w.getframerate()
+                    _voice_dur[(lang, key)] = w.getnframes() / w.getframerate()
     except Exception as e:
         print("语音加载失败（将无声运行）:", e, flush=True)
         _voices = {"cn": {}, "jp": {}}
@@ -496,13 +533,10 @@ class PetWindow(QWidget):
         if self.sound_on:
             snd = load_voices().get(self.voice_lang, {}).get(key)
             if snd is not None:
-                try:
-                    snd.play()
-                except Exception:
-                    pass
+                play_voice(snd)
         text = VOICE_TEXTS.get(key)
         if text:
-            hold = int(_voice_dur.get(key, 2.0) * 1000) + 400
+            hold = int(_voice_dur.get((self.voice_lang, key), 2.0) * 1000) + 400
             self.bubble.say(text, max(hold, 1500))
 
     def _say_or_voice(self, voice_key, text_lines, voice_prob=0.5):
@@ -1166,6 +1200,8 @@ class PetWindow(QWidget):
         self.btn_sound.setText("🔊" if self.sound_on else "🔇")
         if self.sound_on:
             self._beep("pop")
+        else:
+            stop_audio()
         self.bubble.say("（打开声音）" if self.sound_on else "（静音模式）", 1800)
 
     def _on_close_click(self):
