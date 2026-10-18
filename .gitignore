@@ -19,3 +19,6 @@ venv/
 
 # bundle 导出产物
 *.bundle
+
+# 本地迭代计划
+/ITERATION_PLAN.local.md

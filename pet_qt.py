@@ -447,6 +447,21 @@ class MeterWidget(QWidget):
                               bar_h / 2, bar_h / 2)
 
 
+class RecallButton(QPushButton):
+    """主窗口隐藏后仍能点击的独立唤回按钮。"""
+
+    def __init__(self):
+        super().__init__("✨ 唤回汐汐")
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+
+    def closeEvent(self, e):
+        super().closeEvent(e)
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+
 # ---------------------------------------------------------------- 主窗口
 IDLE_UI_OPACITY = 0.55      # 鼠标不在桌宠上时，底部栏/关闭按钮的半虚化透明度
 
@@ -478,6 +493,7 @@ class PetWindow(QWidget):
         self.pat_start = 0
         self.feed_cd = False
         self.chat_open = False
+        self._resting = False
         self.particles = []
         self.food = None
         self._last_frame = 0
@@ -491,6 +507,9 @@ class PetWindow(QWidget):
         self.clock.start()
         self.interact_clock = QElapsedTimer()
         self.interact_clock.start()
+        self._state_timer = QTimer(self)
+        self._state_timer.setSingleShot(True)
+        self._state_timer.timeout.connect(self._state_timeout)
 
         init_sounds()   # 预热音效（需主线程）
         self.voice_lang = "cn"
@@ -517,6 +536,12 @@ class PetWindow(QWidget):
         self.sleep_timer.start(5000)
         self._pat_heart_timer = QTimer(self)
         self._pat_heart_timer.timeout.connect(self._pat_heart_tick)
+        self._rest_timer = QTimer(self)
+        self._rest_timer.setSingleShot(True)
+        self._rest_timer.timeout.connect(self._fade_out)
+        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade.setDuration(500)
+        self._fade.finished.connect(self._after_fade_out)
 
     # ---------------- 音效 ----------------
     def _beep(self, kind="pop"):
@@ -530,6 +555,8 @@ class PetWindow(QWidget):
 
     def say_voice(self, key):
         """播放当前语言的语音，并显示中文字幕"""
+        if self._resting:
+            return
         if self.sound_on:
             snd = load_voices().get(self.voice_lang, {}).get(key)
             if snd is not None:
@@ -672,6 +699,7 @@ class PetWindow(QWidget):
                       font-family:"Microsoft YaHei";selection-background-color:#2ec4d9;}
         """)
         self.chat_input.returnPressed.connect(self._on_chat_submit)
+        self.chat_input.textEdited.connect(self._on_chat_edited)
         self.chat_input.hide()
 
         # 关闭 / 缩放提示 / 唤回
@@ -691,9 +719,10 @@ class PetWindow(QWidget):
         """)
         self.scale_toast.hide()
         self._toast_timer = QTimer(self)
+        self._toast_timer.setSingleShot(True)
         self._toast_timer.timeout.connect(self.scale_toast.hide)
 
-        self.btn_recall = QPushButton("✨ 唤回汐汐", self)
+        self.btn_recall = RecallButton()
         self.btn_recall.setStyleSheet("""
             QPushButton{background:qlineargradient(x1:0,y1:0,x2:1,y2:1,
                         stop:0 #f4826f,stop:1 #f0705f);
@@ -703,6 +732,7 @@ class PetWindow(QWidget):
         self.btn_recall.setGraphicsEffect(self._shadow(CORAL, 12, 4, 100))
         self.btn_recall.setCursor(Qt.PointingHandCursor)
         self.btn_recall.clicked.connect(self._on_recall_click)
+        self.btn_recall.adjustSize()
         self.btn_recall.hide()
 
         # 半虚化效果：鼠标不在桌宠上时，底部栏与关闭按钮变淡（网页版设计）
@@ -742,7 +772,6 @@ class PetWindow(QWidget):
 
     def relayout(self):
         s = self.pet_scale
-        w, h = self.width(), self.height()
         # 按钮风格随缩放刷新（网页版尺寸）
         self._apply_btn_style()
         # 底部栏（状态条组 + 按钮组）
@@ -752,6 +781,11 @@ class PetWindow(QWidget):
         self.bottom_bar.layout().setContentsMargins(m, m, m, m)
         self.bottom_bar.adjustSize()
         bw = self.bottom_bar.width()
+        # 小比例下文字保留可读字号，窗口宽度至少容纳完整按钮栏。
+        target_w = max(int(BASE_W * s), bw + 2 * m)
+        if self.width() != target_w:
+            self.resize(target_w, self.height())
+        w, h = self.width(), self.height()
         self.bottom_bar.move(int((w - bw) / 2), int(h - 12 * s - self.bottom_bar.height()))
         # 聊天输入（底部栏上方）
         iw = int(210 * s)
@@ -766,8 +800,6 @@ class PetWindow(QWidget):
         self.btn_close.move(int(w - 8 * s - cs), close_y)
         self.scale_toast.move(int(w - 8 * s - 60 * s), close_y + cs + int(4 * s))
         self.scale_toast.setFont(text_font(max(9, int(11 * s))))
-        # 唤回按钮
-        self.btn_recall.move(int((w - self.btn_recall.width()) / 2), int(h / 2))
         # 气泡宽度与位置
         self.bubble.set_scale(s, self.width())
         self._position_bubble()
@@ -842,10 +874,11 @@ class PetWindow(QWidget):
         return sx, sy, rot, dx, dy
 
     def _set_state(self, st, duration=0):
+        self._state_timer.stop()
         self.pet_state = st
         self.state_start = self.clock.elapsed()
         if duration:
-            QTimer.singleShot(duration, self._state_timeout)
+            self._state_timer.start(duration)
 
     def _state_timeout(self):
         if self.pet_state in ("happy", "eating", "thinking"):
@@ -998,14 +1031,15 @@ class PetWindow(QWidget):
     def _mark_interact(self):
         self.interact_clock.restart()
 
-    def wake_if_asleep(self):
+    def wake_if_asleep(self, speak=True):
         if self.asleep:
             self.asleep = False
             self._set_state("idle")
-            self._say_or_voice("hello", LINES["wake"])
+            if speak:
+                self._say_or_voice("hello", LINES["wake"])
 
     def start_pat(self):
-        if self.patting:
+        if self._resting or self.patting:
             return
         self.patting = True
         self.pat_start = self.clock.elapsed()
@@ -1023,6 +1057,7 @@ class PetWindow(QWidget):
     def end_pat(self):
         if not self.patting:
             return
+        self._mark_interact()
         self.patting = False
         self._pat_heart_timer.stop()
         dur = self.clock.elapsed() - self.pat_start
@@ -1037,7 +1072,7 @@ class PetWindow(QWidget):
         self.update_meters()
 
     def feed(self):
-        if self.feed_cd:
+        if self._resting or self.feed_cd:
             return
         self.feed_cd = True
         self._mark_interact()
@@ -1052,6 +1087,8 @@ class PetWindow(QWidget):
         self.feed_cd = False
 
     def reply(self, text):
+        if self._resting:
+            return
         self._mark_interact()
         self.wake_if_asleep()
         self._beep("chat")
@@ -1059,6 +1096,8 @@ class PetWindow(QWidget):
         self.bubble.say("……", 900)
 
         def answer():
+            if self._resting:
+                return
             if "对吗" in text:
                 self.say_voice(pick(["yes", "no"]))
                 return
@@ -1096,7 +1135,10 @@ class PetWindow(QWidget):
         QTimer.singleShot(650, answer)
 
     def say_hello(self):
+        if self._resting:
+            return
         self._mark_interact()
+        self.wake_if_asleep(speak=False)
         self._beep("pop")
         self._say_or_voice("hello", LINES["greet"])
         self.mood = min(100, self.mood + 3)
@@ -1108,10 +1150,11 @@ class PetWindow(QWidget):
 
     # ---------------- 定时逻辑 ----------------
     def _greet(self):
-        self.say_voice("greet")
+        if not self._resting:
+            self.say_voice("greet")
 
     def _idle_chatter(self):
-        if self.asleep or self.patting or self.chat_open:
+        if self._resting or self.asleep or self.patting or self.chat_open:
             return
         if self.interact_clock.elapsed() < 9000:
             return
@@ -1120,18 +1163,20 @@ class PetWindow(QWidget):
                 self._say_or_voice("sad", LINES["idleHungry"])
             else:
                 self._say_or_voice(pick(["idle1", "idle2", "idle3"]), LINES["idle"])
-            self._mark_interact()
 
     def _hunger_tick(self):
+        if self._resting:
+            return
         self.fullness = max(0, self.fullness - 1.6)
         self.mood = max(0, self.mood - 0.8)
         if self.fullness < 25 and not self.asleep and random.random() < 0.35:
             self._say_or_voice("sad", LINES["hungry"])
-            self._mark_interact()
         self.update_meters()
 
     def _sleep_check(self):
-        if self.interact_clock.elapsed() > 75000 and not self.asleep:
+        if self._resting or self.patting or self._dragging or self.voice_menu.isVisible():
+            return
+        if self.interact_clock.elapsed() >= 75000 and not self.asleep:
             self.asleep = True
             self._set_state("asleep")
             self._say_or_voice("sleep", LINES["sleep"])
@@ -1162,6 +1207,15 @@ class PetWindow(QWidget):
         if text:
             self.reply(text)
 
+    def _on_chat_edited(self, _text):
+        self._mark_interact()
+        self.wake_if_asleep()
+
+    def _on_voice_selected(self, key):
+        self._mark_interact()
+        self.wake_if_asleep(speak=False)
+        self.say_voice(key)
+
     def _build_voice_menu(self):
         from PyQt5.QtWidgets import QMenu
         self.voice_menu = QMenu(self)
@@ -1187,15 +1241,18 @@ class PetWindow(QWidget):
         ]
         for key, label in items:
             act = self.voice_menu.addAction(label)
-            act.triggered.connect(lambda checked=False, k=key: self.say_voice(k))
+            act.triggered.connect(lambda checked=False, k=key: self._on_voice_selected(k))
 
     def _on_lang_click(self):
         self.voice_lang = "jp" if self.voice_lang == "cn" else "cn"
         self.btn_lang.setText("日" if self.voice_lang == "jp" else "中")
         self._mark_interact()
+        self.wake_if_asleep(speak=False)
         self.say_voice("hello")   # 用新语言打声招呼，字幕仍是中文
 
     def _on_sound_click(self):
+        self._mark_interact()
+        self.wake_if_asleep(speak=False)
         self.sound_on = not self.sound_on
         self.btn_sound.setText("🔊" if self.sound_on else "🔇")
         if self.sound_on:
@@ -1205,35 +1262,96 @@ class PetWindow(QWidget):
         self.bubble.say("（打开声音）" if self.sound_on else "（静音模式）", 1800)
 
     def _on_close_click(self):
+        if self._resting:
+            return
+        self._resting = True
         self._mark_interact()
+        self.idle_timer.stop()
+        self.hunger_timer.stop()
+        self.sleep_timer.stop()
+        self._pat_heart_timer.stop()
+        self.patting = False
+        self._dragging = False
+        self.food = None
+        self.chat_open = False
+        self.chat_input.hide()
+        self.bottom_bar.setEnabled(False)
+        self.btn_close.setEnabled(False)
+        self._set_state("idle")
         self.bubble.say(pick(LINES["closeBye"]), 2200)
         self._beep("pop")
-        QTimer.singleShot(1400, self._fade_out)
+        self._rest_timer.start(1400)
 
     def _fade_out(self):
-        self._fade = QPropertyAnimation(self, b"windowOpacity")
-        self._fade.setDuration(500)
-        self._fade.setStartValue(1.0)
+        if not self._resting:
+            return
+        self._fade.setStartValue(self.windowOpacity())
         self._fade.setEndValue(0.0)
-        self._fade.finished.connect(self._after_fade_out)
         self._fade.start()
 
     def _after_fade_out(self):
+        if not self._resting:
+            return
+        self.render_timer.stop()
+        self._toast_timer.stop()
+        self.scale_toast.hide()
+        self.particles.clear()
+        stop_audio()
+        self._position_recall_button()
         self.hide()
         self.setWindowOpacity(1.0)
         self.btn_recall.show()
         self.btn_recall.raise_()
 
+    def _position_recall_button(self):
+        """将独立唤回按钮放在桌宠附近，并留在屏幕可见范围内。"""
+        self.btn_recall.adjustSize()
+        center = self.frameGeometry().center()
+        x = center.x() - self.btn_recall.width() // 2
+        y = center.y() - self.btn_recall.height() // 2
+        screen = QApplication.screenAt(center) or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = max(area.left(), min(x, area.right() - self.btn_recall.width() + 1))
+            y = max(area.top(), min(y, area.bottom() - self.btn_recall.height() + 1))
+        self.btn_recall.move(x, y)
+
     def _on_recall_click(self):
+        if not self._resting:
+            return
         self.btn_recall.hide()
+        self._resting = False
+        self._rest_timer.stop()
+        self._fade.stop()
+        self.setWindowOpacity(1.0)
+        self.asleep = False
+        self.feed_cd = False
+        self._set_state("idle")
+        self._last_frame = 0
+        self.bottom_bar.setEnabled(True)
+        self.btn_close.setEnabled(True)
+        self._mark_interact()
         self.show()
         self.raise_()
+        self.render_timer.start()
+        self.idle_timer.start()
+        self.hunger_timer.start()
+        self.sleep_timer.start()
         self._beep("pop")
-        self._mark_interact()
-        QTimer.singleShot(300, lambda: self.bubble.say("汐汐回来啦！", 2000))
+        self.bubble.say("汐汐回来啦！", 2000)
+
+    def closeEvent(self, e):
+        self.btn_recall.hide()
+        super().closeEvent(e)
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
 
     # ---------------- 缩放 ----------------
     def wheelEvent(self, e):
+        if self._resting:
+            e.ignore()
+            return
         delta = e.angleDelta().y()
         if delta == 0:
             e.ignore()
@@ -1251,12 +1369,22 @@ class PetWindow(QWidget):
         self._pix_cache = (-1, None, None)      # 缓存失效
         self.resize(int(BASE_W * s), int(BASE_H * s))   # 原生 resize，丝滑
         self.relayout()
+        # 放大后收回超出屏幕的部分，保留关闭按钮和底部栏的操作位置。
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            area = screen.availableGeometry()
+            x = max(area.left(), min(self.x(), area.right() - self.width() + 1))
+            y = max(area.top(), min(self.y(), area.bottom() - self.height() + 1))
+            self.move(x, y)
         self.scale_toast.setText("%d%%" % int(s * 100))
         self.scale_toast.show()
         self._toast_timer.start(900)
 
     # ---------------- 鼠标（原生拖动） ----------------
     def mousePressEvent(self, e):
+        if self._resting:
+            e.ignore()
+            return
         if e.button() == Qt.RightButton:
             self._mark_interact()
             self.voice_menu.exec_(e.globalPos())
@@ -1271,14 +1399,17 @@ class PetWindow(QWidget):
             self._drag_moved = False
             self._drag_offset = e.globalPos() - self.frameGeometry().topLeft()
             self._mark_interact()
+            self.wake_if_asleep(speak=False)
             e.accept()
 
     def mouseMoveEvent(self, e):
         self._mouse_pos = e.pos()
         if self._dragging:
-            if e.globalPos() != self._drag_offset:
+            self._mark_interact()
+            target = e.globalPos() - self._drag_offset
+            if target != self.pos():
                 self._drag_moved = True
-            self.move(e.globalPos() - self._drag_offset)
+                self.move(target)
             e.accept()
 
     def mouseReleaseEvent(self, e):
@@ -1286,6 +1417,7 @@ class PetWindow(QWidget):
             if self.patting:
                 self.end_pat()
             if self._dragging:
+                self._mark_interact()
                 self._dragging = False
                 if not self._drag_moved:
                     self.say_hello()
@@ -1297,6 +1429,7 @@ def main():
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
+    app.aboutToQuit.connect(stop_audio)
     pet = PetWindow()
     geo = app.primaryScreen().availableGeometry()
     pet.move(geo.right() - pet.width() - 40, geo.bottom() - pet.height() - 60)
